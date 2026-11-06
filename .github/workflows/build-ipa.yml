@@ -1,0 +1,135 @@
+# nxnative(https://github.com/seedds/nxnative)로 본인 소유 게임의 IPA를 GitHub macOS 러너에서 빌드합니다.
+#
+# 준비물 (Settings → Secrets and variables → Actions → New repository secret):
+#   PROD_KEYS : 본인 기기에서 뽑은 prod.keys 파일 내용 전체 (텍스트 그대로 붙여넣기)
+#   GAME_URL  : 게임 파일(.nsp/.xci/.nsz/.xcz 하나, 또는 그것들을 담은 .zip)의 직접 다운로드 링크
+#               (본편 + 업데이트 + DLC를 zip 하나로 묶어 두는 것을 권장)
+# 그런 다음 Actions → "Build IPA" → Run workflow.
+#
+# 주의: 공개 저장소에서는 로그와 아티팩트(IPA)를 다른 사람도 볼 수 있습니다. 저장소를 Private로 바꾼 뒤 실행하세요.
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      nxnative_ref:
+        description: nxnative 브랜치/태그/커밋
+        default: main
+      romfs:
+        description: "bundle = 게임 데이터를 IPA에 포함, separate = 제외(IPA가 작아짐)"
+        type: choice
+        options: [bundle, separate]
+        default: bundle
+      language:
+        description: 게임 언어 코드 (예 ko, ja, en-GB). 비우면 기본값
+        default: ko
+      allow_other_metal:
+        description: 러너의 Xcode가 27.2가 아닐 때도 셰이더 빌드 진행 (--allow-other-metal)
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - name: 시크릿 확인
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          GAME_URL: ${{ secrets.GAME_URL }}
+        run: |
+          [ -n "$PROD_KEYS" ] || { echo "::error::PROD_KEYS 시크릿이 없습니다"; exit 1; }
+          [ -n "$GAME_URL" ]  || { echo "::error::GAME_URL 시크릿이 없습니다"; exit 1; }
+
+      - name: 디스크 공간 확보
+        run: |
+          df -h /
+          # 사용하지 않는 Xcode, 시뮬레이터 런타임, Android SDK 제거
+          ls -d /Applications/Xcode*.app || true
+          sudo rm -rf "$HOME/Library/Android" /usr/local/share/dotnet/sdk-manifests/*/microsoft.net.sdk.android* 2>/dev/null || true
+          xcrun simctl delete all 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          df -h /
+
+      - name: Xcode 선택 (27.x 우선)
+        run: |
+          pick=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$pick" ] || pick=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v beta | sort -V | tail -1)
+          [ -n "$pick" ] || pick=/Applications/Xcode.app
+          echo "selected: $pick"
+          sudo xcode-select -s "$pick"
+          # 선택하지 않은 다른 Xcode는 지워 공간 확보
+          for x in /Applications/Xcode_*.app; do [ "$x" = "$pick" ] || sudo rm -rf "$x"; done
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain
+          xcodebuild -downloadPlatform iOS || true
+          xcrun -sdk iphoneos metal --version
+          df -h /
+
+      - name: nxnative 받기
+        run: git clone https://github.com/seedds/nxnative.git nxnative && git -C nxnative checkout "${{ inputs.nxnative_ref }}" && git -C nxnative log -1 --oneline
+
+      - name: 도구 설치
+        run: |
+          brew install xcodegen zstd glslang
+          brew install --cask dotnet-sdk || true
+          dotnet --version
+          python3 --version
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -r nxnative/.github/requirements/tools.txt
+          "$RUNNER_TEMP/venv/bin/pip" install "backports.zstd; python_version < '3.14'"
+
+      - name: 게임과 키 준비
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+          GAME_URL: ${{ secrets.GAME_URL }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys" "$RUNNER_TEMP/game"
+          printf '%s\n' "$PROD_KEYS" > "$RUNNER_TEMP/keys/prod.keys"
+          cd "$RUNNER_TEMP/game"
+          curl -fL --retry 3 -o download.bin "$GAME_URL"
+          if unzip -tq download.bin >/dev/null 2>&1; then
+            unzip -q download.bin && rm download.bin
+            # zip 안에 폴더가 있어도 게임 파일을 최상위로 꺼냄
+            find . -mindepth 2 -type f \( -iname '*.nsp' -o -iname '*.xci' -o -iname '*.nsz' -o -iname '*.xcz' \) -exec mv {} . \;
+          else
+            ext=$(python3 -c "import sys,urllib.parse,os;print(os.path.splitext(urllib.parse.urlparse(sys.argv[1]).path)[1].lower() or '.nsp')" "$GAME_URL")
+            mv download.bin "game$ext"
+          fi
+          ls -la
+          df -h /
+
+      - name: IPA 빌드
+        run: |
+          args=(--romfs "${{ inputs.romfs }}" --no-keep-extracted --progress lines)
+          [ -n "${{ inputs.language }}" ] && args+=(-l "${{ inputs.language }}")
+          [ "${{ inputs.allow_other_metal }}" = "true" ] && args+=(--allow-other-metal)
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/venv/bin/python" nxnative/scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" \
+            -k "$RUNNER_TEMP/keys/prod.keys" "${args[@]}"
+          find "$RUNNER_TEMP/game" -maxdepth 1 -name '*.ipa' -exec mv {} "$RUNNER_TEMP/out/" \;
+          ls -la "$RUNNER_TEMP/out"
+
+      - name: 키 삭제
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+      - name: IPA 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: ${{ runner.temp }}/out/*.ipa
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: 실패 시 로그 업로드
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            ${{ runner.temp }}/game/*_build/**/*.log
+            ${{ runner.temp }}/game/*_build/**/survey*
+          if-no-files-found: ignore
+          retention-days: 3
